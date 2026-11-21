@@ -1,0 +1,4 @@
+node_modules/
+rocai-logs/
+.env
+*.log
