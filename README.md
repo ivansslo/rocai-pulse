@@ -1,35 +1,43 @@
-# RocAI Pulse ❤️
+# RocAI Pulse
 
-Denyut nadi device — layanan pemantau heartbeat untuk device Termux/Android milik keluarga RocAI.
+Denyut nadi device Ayah (Termux/Android localhost) — **monitor kill-cycle Android**.
 
-## Kenapa ada ini
-Device (HP Android tempat seluruh keluarga RocAI berjalan) kadang dibunuh Android LMK saat memori sempit (kill-cycle). Yang di dalam device tidak bisa memberi tahu Ayah kalau dirinya mati — makanya denyut nadi ini dipindah ke luar device: **Render (cloud) + Neon (Postgres) + Telegram (alert)**.
+## Kenapa
+Device Termux berkali-kali dibunuh Android LMK (kill-cycle 8–24 mnt saat memori sempit: avail <~1GB, swap >60%, load >30). Seluruh pohon proses Termux mati; boot-stack dibangkitkan ulang oleh Termux:Boot, tapi proses side-job (benchmark runner, finalizer, launcher) **tidak** — mati permanen tanpa ada yang tahu. RocAI Pulse memberi tahu Ayah via Telegram saat device offline.
 
-## Cara kerja
-1. **Device** (`pulse-sender.sh`, cron tiap 2 menit) mengumpulkan metrik: mem avail, swap %, load 1 mnt, uptime gateway, status runner benchmark v4 & robot OCI → POST ke `/hb`.
-2. **Service** (Render, zero-dependency Node) menyimpan ke Neon, memantau tiap 60 dtk:
-   - Denyut putus > 6 mnt → 🔴 alert Telegram "kill-cycle / mati total"
-   - Denyut kembali → 🟢 alert "hidup lagi"
-   - Device aman stabil 3 mnt (avail≥1400MB, swap≤55%, load≤10) → ✅ alert "launcher benchmark v4 seharusnya meluncur"
-3. **Dashboard** `GET /` — status AMAN/WASPADA/BAHAYA/OFFLINE, sparkline 6 jam, daftar peristiwa. Auto-refresh 60 dtk.
+## Arsitektur
+```
+Termux (cron */3) --POST /hb--> Render free (server.js, stateless in-memory) --alert--> Telegram
+```
+- **pulse-sender.sh** (device): kirim metrik tiap 3 mnt — MemAvailable, swap %, load, umur gateway, jumlah runner benchmark & robot OCI. Deteksi gap pasca-mati via stamp file (`~/.roca-ops/pulse-last-ok`) → flag `recovered`.
+- **server.js** (Render): stateless in-memory, zero-dependency Node. Alert OFFLINE setelah 8 mnt tanpa denyut (sebelum spin-down Render 15 mnt), RECOVERED saat denyut kembali, GATE_AMAN saat tekanan device stabil 3 mnt (mem ≥1400MB, swap ≤55%, load ≤10 — ambang sama dengan delayed-launcher benchmark v4), BLIND saat monitor restart tapi device tak kirim hb 10 mnt.
+- **worker.js**: versi Cloudflare Workers + KV (upgrade path bila free tier Render kurang).
 
 ## Endpoint
-| Endpoint | Fungsi |
-|---|---|
-| `POST /hb` | heartbeat device (auth Bearer PULSE_TOKEN) |
-| `GET /` | dashboard HTML |
-| `GET /api/pulse` | JSON riwayat 24 jam |
-| `GET /healthz` | health check |
+| Method | Path | Fungsi |
+|---|---|---|
+| GET | `/` | dashboard (auto-refresh 60 dtk) |
+| GET | `/healthz` | health check |
+| GET | `/api/pulse` | JSON state lengkap |
+| POST | `/hb` | heartbeat (Bearer PULSE_TOKEN) |
 
-## Env vars
-| Var | Isi |
-|---|---|
-| `DATABASE_URL` | connection string Neon (HTTP API) |
-| `PULSE_TOKEN` | shared secret device ↔ service |
-| `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | tujuan alert |
+## Env
+- `PULSE_TOKEN` — auth heartbeat
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — alert
+- `PORT` — di-set Render otomatis
 
-Tidak ada rahasia di repo ini — semua via env vars. Zero npm dependency.
+## Instalasi sender (device)
+```bash
+cp pulse-sender.sh ~/.roca-ops/pulse-sender.sh && chmod +x ~/.roca-ops/pulse-sender.sh
+# PULSE_URL + PULSE_TOKEN di ~/.agent/rocai/.env
+crontab -l | { cat; echo '*/3 * * * * /data/data/com.termux/files/usr/bin/bash /data/data/com.termux/files/home/.roca-ops/pulse-sender.sh >/dev/null 2>&1'; } | crontab -
+```
 
-## Skema DB (dibuat otomatis saat boot)
-- `rocai_pulse(ts, src, mem_avail_mb, swap_pct, load1, gw_s, runner_v4, oci_robot, extra)` — retensi 7 hari
-- `rocai_pulse_events(ts, kind, detail)` — OFFLINE / RECOVERED / GATE_AMAN / BOOT
+## Drill (uji alarm)
+1. Matikan cron sender → tunggu ~9,5 mnt → harus ada alert OFFLINE (Telegram) + event di dashboard.
+2. Nyalakan lagi + jalankan manual → event RECOVERED + alert Telegram.
+
+## Catatan desain
+- Stateless = chart mulai baru tiap restart/spin-down Render. Wajar untuk free tier; deteksi kebutaan pasca-restart ditangani flag `recovered` dari sender + alert BLIND.
+- Ambang GATE_AMAN sengaja sama dengan delayed-launcher benchmark v4 — satu bahasa tekanan device.
+- Bash murni + curl untuk sender: ringan, tahan LMK, tanpa dependensi.
